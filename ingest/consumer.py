@@ -40,6 +40,7 @@ KHUNG THỰC HIỆN — NHIỆM VỤ 5
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -53,7 +54,7 @@ TABLE = "bronze_events_stream"
 
 DDL = f"""
 create table if not exists {TABLE} (
-    event_id      varchar,
+    event_id      varchar primary key,
     ticket_id     varchar,
     customer_id   varchar,
     customer_name varchar,
@@ -66,21 +67,37 @@ create table if not exists {TABLE} (
 
 
 def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
-    """Ghi một lô message xuống kho — nhiệm vụ 5, hạng mục (b).
-
-    Câu lệnh hiện tại là INSERT thuần: ghi lại cùng một event_id sẽ tạo thêm
-    một hàng mới. Xem khung mã giả ở đầu file.
-    """
-    con.executemany(
-        f"insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            (
-                r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
-                r["event_type"], r["latency_ms"], r["event_time"], r["_ingested_at"],
-            )
-            for r in batch
-        ],
-    )
+    """Ghi nguyên tử một batch; replay cùng event_id sẽ cập nhật, không nhân bản."""
+    payload = json.dumps(batch, ensure_ascii=False)
+    con.execute("begin transaction")
+    try:
+        # Parse cả batch JSON trong DuckDB, tránh một round trip cho mỗi row.
+        con.execute(
+            f"""insert into {TABLE}
+            select
+                value ->> '$.event_id',
+                value ->> '$.ticket_id',
+                value ->> '$.customer_id',
+                value ->> '$.customer_name',
+                value ->> '$.event_type',
+                (value ->> '$.latency_ms')::integer,
+                (value ->> '$.event_time')::timestamp,
+                (value ->> '$._ingested_at')::timestamp
+            from json_each(?)
+            on conflict (event_id) do update set
+                ticket_id = excluded.ticket_id,
+                customer_id = excluded.customer_id,
+                customer_name = excluded.customer_name,
+                event_type = excluded.event_type,
+                latency_ms = excluded.latency_ms,
+                event_time = excluded.event_time,
+                _ingested_at = excluded._ingested_at""",
+            [payload],
+        )
+        con.execute("commit")
+    except Exception:
+        con.execute("rollback")
+        raise
 
 
 def maybe_crash(batch_no: int, crash_at: int | None) -> None:
@@ -112,9 +129,9 @@ def consume(
             # ── KHỐI CẦN XEM XÉT — nhiệm vụ 5, hạng mục (a) ───────────────
             # Ba dòng dưới đây được phép sắp xếp lại. maybe_crash() mô phỏng
             # `kill -9`: tiến trình chết ngay tại vị trí của nó, không rollback.
-            consumer.commit()                 # ghi nhận offset
-            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
-            write_batch(con, batch)           # ghi dữ liệu
+            write_batch(con, batch)           # ghi idempotent trước
+            maybe_crash(batch_no, crash_at)   # crash -> batch sẽ được phát lại
+            consumer.commit()                 # chỉ commit sau khi ghi thành công
             # ─────────────────────────────────────────────────────────────
 
             written += len(batch)

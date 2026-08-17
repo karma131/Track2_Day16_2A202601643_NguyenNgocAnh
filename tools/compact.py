@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tái cấu trúc dataset Parquet của dashboard — NHIỆM VỤ 4.  CHƯA CÓ LOGIC.
+"""Tái cấu trúc dataset Parquet của dashboard — NHIỆM VỤ 4.
 
 Hiện trạng: `data/gold_events/` gồm 5.000 file, mỗi file vài chục KB, không
 partition, thứ tự hàng ngẫu nhiên.
@@ -46,6 +46,7 @@ phải giảm, `files` phải giảm, và `result hash` phải GIỮ NGUYÊN.
 from __future__ import annotations
 
 import pathlib
+import shutil
 import sys
 
 import duckdb
@@ -63,27 +64,39 @@ def main() -> int:
     n_src = len(list(SRC.glob("*.parquet")))
     print(f"  nguồn : {SRC}  ({n_src:,} file)")
 
-    # TODO(nhiệm vụ 4): hiện thực khung COPY ... TO ... ở phần docstring.
-    #
-    #   con.execute(f"""
-    #       copy (
-    #           select * from read_parquet('{SRC}/*.parquet')
-    #           order by ...
-    #       ) to '{DST}' (
-    #           format parquet,
-    #           partition_by (...),
-    #           overwrite_or_ignore,
-    #           row_group_size ...
-    #       )
-    #   """)
-    #
-    # Sau đó kiểm tra không mất hàng nào:
-    #
-    #   assert <số row dataset cũ> == <số row dataset mới>
+    if n_src == 0:
+        raise SystemExit("không tìm thấy dữ liệu nguồn; hãy chạy make seed-extra trước")
 
-    print("\n  tools/compact.py chưa được hiện thực — đây là nhiệm vụ 4.")
-    print("  Mở file này, đọc phần KHUNG THỰC HIỆN ở đầu file và điền vào TODO.")
-    print("  Hướng dẫn từng bước: GUIDE.md mục 4.\n")
+    n_rows_src = con.execute(
+        f"select count(*) from read_parquet('{SRC}/*.parquet')"
+    ).fetchone()[0]
+
+    # 14 ngày là cardinality partition vừa phải. Bên trong mỗi ngày, sắp theo
+    # khách hàng giúp zone map loại row group khi dashboard lọc customer_name.
+    # Row group 2.048 đủ nhỏ để một ngày không bị gom thành một khối duy nhất.
+    shutil.rmtree(DST, ignore_errors=True)
+    con.execute(f"""
+        copy (
+            select *
+            from read_parquet('{SRC}/*.parquet')
+            order by event_date, customer_name, event_time
+        ) to '{DST}' (
+            format parquet,
+            partition_by (event_date),
+            overwrite_or_ignore,
+            row_group_size 2048
+        )
+    """)
+
+    new_files = list(DST.rglob("*.parquet"))
+    n_rows_dst = con.execute(
+        f"select count(*) from read_parquet('{DST}/**/*.parquet', hive_partitioning=true)"
+    ).fetchone()[0]
+    assert n_rows_src == n_rows_dst, (n_rows_src, n_rows_dst)
+    con.close()
+
+    print(f"  đích  : {DST}  ({len(new_files):,} file)")
+    print(f"  số hàng: {n_rows_src:,} -> {n_rows_dst:,} (không đổi)\n")
     return 0
 
 
